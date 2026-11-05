@@ -1,0 +1,381 @@
+"""Offline document editing tests with synthetic in-memory labels."""
+import importlib.util
+from contextlib import redirect_stderr
+from copy import deepcopy
+import io
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+import zipfile
+import warnings
+from unittest.mock import patch
+
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from editor.document import LabelDocument
+from editor.backend import core, legacy
+
+fixture_spec = importlib.util.spec_from_file_location(
+    'document_fixture', Path(__file__).with_name('test_ptd610bt_lbx.py'))
+fixtures = importlib.util.module_from_spec(fixture_spec)
+fixture_spec.loader.exec_module(fixtures)
+
+
+class DocumentTests(unittest.TestCase):
+    def test_new_label_renders_and_round_trips(self):
+        doc = LabelDocument.new()
+        self.assertFalse(doc.dirty)
+        self.assertEqual(doc.render().height, 64)
+        again = LabelDocument.from_bytes(doc.to_bytes())
+        self.assertEqual(again.objects()[0].text, 'Label')
+        self.assertAlmostEqual(again.length_mm, 35, places=4)
+        self.assertFalse(again.dirty)
+
+    def test_open_preserves_bytes_and_mixed_styles(self):
+        data = fixtures.fixture()
+        doc = LabelDocument.from_bytes(data)
+        self.assertEqual(doc.to_bytes(), data)
+        self.assertEqual(len(doc.objects()), 2)
+        self.assertTrue(doc.objects()[0].mixed_style)
+        self.assertFalse(doc.dirty)
+
+    def test_text_edit_save_as_preserves_original_assets_and_metadata(self):
+        base = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(fixtures.fixture())) as source:
+            with zipfile.ZipFile(base, 'w') as target:
+                for item in source.infolist(): target.writestr(item, source.read(item))
+                target.writestr('prop.xml', b'<properties><value>kept</value></properties>')
+                target.comment = b'archive metadata'
+        data = base.getvalue()
+        with tempfile.TemporaryDirectory() as folder:
+            original = Path(folder) / 'original.lbx'
+            output = Path(folder) / 'edited.lbx'
+            original.write_bytes(data)
+            doc = LabelDocument.load(original)
+            key = doc.objects()[0].id
+            doc.update_text(key, 'NEW', font_size=8, bold=True)
+            self.assertTrue(doc.dirty)
+            self.assertEqual(doc.objects()[0].id, key)
+            self.assertFalse(doc.objects()[0].mixed_style)
+            doc.save_as(output)
+            self.assertFalse(doc.dirty)
+            self.assertEqual(original.read_bytes(), data)
+            reopened = LabelDocument.load(output)
+            self.assertEqual(reopened.objects()[0].text, 'NEW')
+            with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(output) as target:
+                self.assertEqual(source.read('icon.png'), target.read('icon.png'))
+                self.assertEqual(source.read('prop.xml'), target.read('prop.xml'))
+                self.assertEqual(source.comment, target.comment)
+            with self.assertRaises((OSError, core.DiagnosticError)):
+                doc.save_as(original)
+            with self.assertRaises((OSError, core.DiagnosticError)):
+                doc.save_as(output)
+
+    def test_failed_edit_leaves_state_history_and_dirty_unchanged(self):
+        doc = LabelDocument.from_bytes(fixtures.fixture())
+        before = doc.to_bytes()
+        key = doc.objects()[0].id
+        with self.assertRaises(core.DiagnosticError):
+            doc.update_text(key, 'much too long ' * 40, font_size=24)
+        self.assertEqual(doc.to_bytes(), before)
+        self.assertFalse(doc.can_undo)
+        self.assertFalse(doc.dirty)
+
+    def test_combined_update_is_atomic_and_one_undo_step(self):
+        doc = LabelDocument.from_bytes(fixtures.fixture())
+        key = doc.objects()[0].id
+        before = doc.to_bytes()
+        with self.assertRaises(core.DiagnosticError):
+            doc.update_object(key, text='NEW', x_mm=-1)
+        self.assertEqual(doc.to_bytes(), before)
+        self.assertFalse(doc.can_undo)
+        doc.update_object(key, text='NEW', x_mm=12)
+        self.assertEqual(doc.objects()[0].text, 'NEW')
+        self.assertAlmostEqual(doc.objects()[0].x_mm, 12)
+        doc.undo()
+        self.assertEqual(doc.to_bytes(), before)
+        self.assertFalse(doc.can_undo)
+
+    def test_staged_length_and_text_commit_is_one_undo_step(self):
+        doc = LabelDocument.new()
+        key = doc.objects()[0].id
+        candidate = deepcopy(doc)
+        candidate.set_length(40)
+        candidate.update_text(key, 'Changed')
+        self.assertAlmostEqual(doc.length_mm, 35)
+        self.assertFalse(doc.dirty)
+        doc.commit_candidate(candidate)
+        self.assertAlmostEqual(doc.length_mm, 40)
+        self.assertEqual(doc.objects()[0].text, 'Changed')
+        self.assertTrue(doc.dirty)
+        doc.undo()
+        self.assertAlmostEqual(doc.length_mm, 35)
+        self.assertEqual(doc.objects()[0].text, 'Label')
+        self.assertFalse(doc.can_undo)
+        self.assertFalse(doc.dirty)
+        doc.redo()
+        self.assertAlmostEqual(doc.length_mm, 40)
+        self.assertEqual(doc.objects()[0].text, 'Changed')
+
+    def test_staged_commit_preserves_earlier_history_and_rejects_invalid_candidate(self):
+        doc = LabelDocument.new()
+        key = doc.objects()[0].id
+        doc.update_text(key, 'First')
+        before = doc.to_bytes()
+        candidate = deepcopy(doc)
+        candidate.set_length(40)
+        candidate.update_text(key, 'Changed')
+        doc.commit_candidate(candidate)
+        doc.undo()
+        self.assertEqual(doc.to_bytes(), before)
+        self.assertTrue(doc.can_undo)
+        doc.undo()
+        self.assertEqual(doc.objects()[0].text, 'Label')
+        self.assertFalse(doc.dirty)
+        candidate._data = b'not a valid LBX'
+        before = doc.to_bytes()
+        can_redo = doc.can_redo
+        with self.assertRaises(core.DiagnosticError): doc.commit_candidate(candidate)
+        self.assertEqual(doc.to_bytes(), before)
+        self.assertFalse(doc.can_undo)
+        self.assertEqual(doc.can_redo, can_redo)
+        self.assertFalse(doc.dirty)
+
+    def test_undo_redo_restore_ids_and_saved_dirty_state(self):
+        doc = LabelDocument.from_bytes(fixtures.fixture())
+        key = doc.objects()[0].id
+        doc.update_text(key, 'ONE')
+        self.assertTrue(doc.can_undo)
+        doc.undo()
+        self.assertEqual(doc.objects()[0].text, 'AA\nBB')
+        self.assertEqual(doc.objects()[0].id, key)
+        self.assertFalse(doc.dirty)
+        doc.redo()
+        self.assertEqual(doc.objects()[0].text, 'ONE')
+        self.assertTrue(doc.dirty)
+        doc.undo()
+        doc.update_text(key, 'TWO')
+        self.assertFalse(doc.can_redo)
+
+    def test_add_image_and_text_then_remove_and_undo(self):
+        with tempfile.TemporaryDirectory() as folder:
+            image = Path(folder) / 'example.png'
+            Image.new('RGB', (12, 8), 'black').save(image)
+            doc = LabelDocument.new()
+            text = doc.add_text('A')
+            picture = doc.add_image(image)
+            self.assertEqual(len(doc.objects()), 3)
+            self.assertEqual(doc.objects()[-1].id, picture)
+            self.assertEqual(doc.objects()[-1].kind, 'image')
+            doc.remove(text)
+            self.assertEqual(len(doc.objects()), 2)
+            doc.undo()
+            self.assertIn(text, [obj.id for obj in doc.objects()])
+            self.assertEqual(LabelDocument.from_bytes(doc.to_bytes()).render().height, 64)
+
+    def test_geometry_is_relative_to_band_and_invalid_moves_are_transactional(self):
+        doc = LabelDocument.from_bytes(fixtures.fixture())
+        item = doc.objects()[1]
+        self.assertAlmostEqual(item.x_mm, 0)
+        doc.update_geometry(item.id, 1, 0, item.width_mm, item.height_mm)
+        self.assertAlmostEqual(doc.objects()[1].x_mm, 1)
+        before = doc.to_bytes()
+        with self.assertRaises(core.DiagnosticError):
+            doc.update_geometry(item.id, -1, 0, item.width_mm, item.height_mm)
+        self.assertEqual(doc.to_bytes(), before)
+
+    def test_resize_validates_content_and_last_removal_creates_editable_blank(self):
+        doc = LabelDocument.new()
+        doc.set_length(40)
+        self.assertAlmostEqual(doc.length_mm, 40)
+        with self.assertRaises(core.DiagnosticError): doc.set_length(200)
+        doc.remove(doc.objects()[0].id)
+        self.assertEqual(doc.objects(), [])
+        self.assertTrue(doc.is_blank)
+
+    def test_clear_text_removes_block_and_keeps_image_and_undo(self):
+        doc = LabelDocument.from_bytes(fixtures.fixture())
+        original = doc.to_bytes()
+        text, image = doc.objects()
+        doc.update_object(text.id, text='')
+        self.assertEqual([obj.id for obj in doc.objects()], [image.id])
+        self.assertFalse(doc.is_blank)
+        self.assertEqual(doc.render().height, 64)
+        doc.undo()
+        self.assertEqual(doc.to_bytes(), original)
+        self.assertFalse(doc.dirty)
+        doc.redo()
+        self.assertEqual([obj.id for obj in doc.objects()], [image.id])
+
+    def test_clear_last_text_blank_save_restore_and_add_new_content(self):
+        doc = LabelDocument.new()
+        key = doc.objects()[0].id
+        doc.update_object(key, text='')
+        self.assertEqual(doc.objects(), [])
+        self.assertTrue(doc.is_blank)
+        self.assertEqual(doc.render().histogram()[0], 0)
+        with self.assertRaises(core.DiagnosticError): legacy.render_lbx(doc.to_bytes())
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / 'blank.lbx'
+            doc.save_as(output)
+            with patch.object(legacy.core, 'connect', side_effect=AssertionError('no radio')) as connect:
+                with redirect_stderr(io.StringIO()):
+                    self.assertEqual(legacy.main(['print', str(output), '--mac', '00:00:00:00:00:00']), 2)
+                connect.assert_not_called()
+            again = LabelDocument.load(output)
+            self.assertTrue(again.is_blank)
+            self.assertFalse(again.dirty)
+            doc.undo()
+            self.assertEqual(doc.objects()[0].text, 'Label')
+            doc.redo()
+            self.assertTrue(doc.is_blank)
+            image = Path(folder) / 'black.png'
+            Image.new('RGBA', (20, 10), 'black').save(image)
+            picture = again.add_image(image)
+            self.assertEqual(again.objects()[0].id, picture)
+            self.assertFalse(again.is_blank)
+            again.remove(picture)
+            again.add_text('Again')
+            self.assertFalse(again.is_blank)
+
+    def test_allow_empty_does_not_weaken_default_renderer_or_geometry_checks(self):
+        source = fixtures.fixture()
+        output = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(source)) as archive:
+            with zipfile.ZipFile(output, 'w') as target:
+                for item in archive.infolist():
+                    value = archive.read(item)
+                    if item.filename == 'label.xml':
+                        value = value.replace(b'AA\nBB', b'').replace(b'charLen="3"', b'charLen="0"')
+                    target.writestr(item, value)
+        with self.assertRaises(core.DiagnosticError): legacy.render_lbx(output.getvalue())
+        image, _ = legacy.render_lbx(output.getvalue(), allow_empty=True)
+        self.assertEqual(image.height, 64)
+        doc = LabelDocument.from_bytes(output.getvalue())
+        self.assertEqual(doc.objects()[0].text, '')
+        before = doc.to_bytes()
+        with self.assertRaises(core.DiagnosticError):
+            doc.update_geometry(doc.objects()[0].id, 0, 10, 10, 10)
+        self.assertEqual(doc.to_bytes(), before)
+
+    def test_crop_changes_real_pixels_and_print_scale_with_single_undo(self):
+        doc = LabelDocument.from_bytes(fixtures.fixture())
+        key = doc.objects()[1].id
+        original = doc.to_bytes()
+        before = doc.objects()[1]
+        bitmap = doc.get_image(key)
+        bitmap.putpixel((0, 0), (255, 0, 0, 255))
+        self.assertNotEqual(bitmap.getpixel((0, 0)), doc.get_image(key).getpixel((0, 0)))
+        expected = doc.get_image(key).crop((8, 4, 32, 28))
+        doc.crop_image(key, (8, 4, 32, 28))
+        self.assertEqual(doc.get_image(key).size, (24, 24))
+        self.assertEqual(doc.get_image(key).tobytes(), expected.tobytes())
+        after = doc.objects()[1]
+        self.assertAlmostEqual(after.width_mm, before.width_mm * 24 / 40, places=6)
+        self.assertAlmostEqual(after.height_mm, before.height_mm * 24 / 32, places=6)
+        self.assertAlmostEqual(after.x_mm, before.x_mm)
+        self.assertAlmostEqual(after.y_mm, before.y_mm)
+        with zipfile.ZipFile(io.BytesIO(original)) as source, zipfile.ZipFile(io.BytesIO(doc.to_bytes())) as edited:
+            self.assertEqual(source.read('icon.png'), edited.read('icon.png'))
+            self.assertEqual(len(edited.namelist()), len(source.namelist()) + 1)
+        doc.undo()
+        self.assertEqual(doc.to_bytes(), original)
+        self.assertFalse(doc.can_undo)
+        doc.redo()
+        self.assertEqual(doc.get_image(key).tobytes(), expected.tobytes())
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'cropped.lbx'
+            doc.save_as(path)
+            reopened = LabelDocument.load(path)
+            self.assertEqual(reopened.get_image(reopened.objects()[1].id).tobytes(), expected.tobytes())
+
+    def test_cropping_to_white_content_remains_editable_and_undoable(self):
+        doc = LabelDocument.from_bytes(fixtures.fixture())
+        text, image = doc.objects()
+        doc.update_object(text.id, text='')
+        self.assertFalse(doc.is_blank)
+        doc.crop_image(image.id, (0, 0, 4, 4))
+        self.assertTrue(doc.is_blank)
+        self.assertEqual(doc.get_image(image.id).size, (4, 4))
+        doc.undo()
+        self.assertFalse(doc.is_blank)
+        self.assertEqual(doc.get_image(image.id).size, (40, 32))
+
+    def test_failed_crop_preserves_state_history_and_other_shared_image(self):
+        doc = LabelDocument.from_bytes(fixtures.fixture())
+        key = doc.objects()[1].id
+        before = doc.to_bytes()
+        for box in [(0, 0, 0, 8), (-1, 0, 3, 8), (0, 0, 41, 32),
+                    (5, 5, 2, 9), (0.5, 0, 5, 8), (True, 0, 5, 8), (0, 1, 2)]:
+            with self.subTest(box=box), self.assertRaises(core.DiagnosticError):
+                doc.crop_image(key, box)
+            self.assertEqual(doc.to_bytes(), before)
+            self.assertFalse(doc.can_undo)
+            self.assertFalse(doc.dirty)
+        with self.assertRaises(core.DiagnosticError): doc.get_image(doc.objects()[0].id)
+        with self.assertRaises(core.DiagnosticError): doc.crop_image(doc.objects()[0].id, (0, 0, 1, 1))
+        # Two image objects deliberately reference the same embedded asset.
+        xml_extra = """<image:image><pt:objectStyle x="5.6pt" y="4pt" width="32pt" height="25.6pt" angle="0" flip="NONE"/><image:imageStyle fileName="icon.png"><image:trimming flag="false"/></image:imageStyle></image:image>"""
+        shared = LabelDocument.from_bytes(fixtures.fixture(extra=xml_extra))
+        first, second = shared.objects()[1:]
+        other_pixels = shared.get_image(second.id).tobytes()
+        other_geometry = second
+        shared.crop_image(first.id, (8, 4, 32, 28))
+        self.assertEqual(shared.get_image(second.id).size, (40, 32))
+        self.assertEqual(shared.get_image(second.id).tobytes(), other_pixels)
+        self.assertEqual(shared.objects()[2], other_geometry)
+
+    def test_refuse_unsupported_duplicates_and_dtd_including_utf16(self):
+        with self.assertRaises(core.DiagnosticError):
+            LabelDocument.from_bytes(fixtures.fixture(extra='<pt:unsupported/>'))
+        duplicate = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UserWarning)
+            with zipfile.ZipFile(duplicate, 'w') as archive:
+                archive.writestr('label.xml', '<a/>')
+                archive.writestr('label.xml', '<b/>')
+        with self.assertRaises(core.DiagnosticError):
+            LabelDocument.from_bytes(duplicate.getvalue())
+        for xml in [b'<!DOCTYPE x [<!ENTITY v "oops">]><x>&v;</x>',
+                    '<!DOCTYPE x [<!ENTITY v "oops">]><x>&v;</x>'.encode('utf-16')]:
+            data = io.BytesIO()
+            with zipfile.ZipFile(data, 'w') as archive: archive.writestr('label.xml', xml)
+            with self.assertRaises(core.DiagnosticError): LabelDocument.from_bytes(data.getvalue())
+
+    def test_unknown_xml_metadata_comments_and_asset_bytes_survive_edit(self):
+        data = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(fixtures.fixture())) as source:
+            with zipfile.ZipFile(data, 'w') as target:
+                for item in source.infolist():
+                    value = source.read(item)
+                    if item.filename == 'label.xml':
+                        value = value.replace(b'<pt:body>', b'<pt:body><!--kept--><pt:custom key="value">metadata</pt:custom>')
+                    target.writestr(item, value)
+        doc = LabelDocument.from_bytes(data.getvalue())
+        doc.update_text(doc.objects()[0].id, 'NEW')
+        with zipfile.ZipFile(io.BytesIO(doc.to_bytes())) as archive:
+            xml = archive.read('label.xml')
+            self.assertIn(b'<!--kept-->', xml)
+            self.assertIn(b'key="value"', xml)
+            self.assertIn(b'>metadata<', xml)
+
+    def test_excessive_xml_depth_fails_cleanly_before_serialization(self):
+        xml = '<x>' * 70 + '</x>' * 70
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, 'w') as archive:
+            archive.writestr('label.xml', xml)
+        with self.assertRaisesRegex(core.DiagnosticError, 'structural limits'):
+            LabelDocument.from_bytes(data.getvalue())
+
+    def test_traversal_entry_is_rejected_without_extracting(self):
+        data = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(fixtures.fixture())) as source:
+            with zipfile.ZipFile(data, 'w') as target:
+                for item in source.infolist(): target.writestr(item, source.read(item))
+                target.writestr('../outside.txt', b'not allowed')
+        with self.assertRaises(core.DiagnosticError): LabelDocument.from_bytes(data.getvalue())
+
+
+if __name__ == '__main__': unittest.main()

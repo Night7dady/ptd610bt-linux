@@ -67,9 +67,9 @@ def font_spec(info, fallback=(400, 8.0)):
     return weight, size
 
 
-def draw_text(canvas, obj, x, y, height):
+def draw_text(canvas, obj, x, y, height, *, allow_empty=False):
     data = needed(obj, "pt:data").text or ""
-    if not data or len(data) > 4096 or any(ord(c) > 0xFFFF for c in data):
+    if (not data and not allow_empty) or len(data) > 4096 or any(ord(c) > 0xFFFF for c in data):
         raise core.DiagnosticError("Empty, excessive or non-BMP text is not supported")
     base = font_spec(needed(obj, "text:ptFontInfo"))
     styles = [base] * len(data)
@@ -92,6 +92,8 @@ def draw_text(canvas, obj, x, y, height):
     line_factor = 1 + float(style.get("lineSpace", "0")) / 100
     if not 0.7 <= line_factor <= 2:
         raise core.DiagnosticError("Unsupported line spacing")
+    if allow_empty and not data.strip():
+        return
     fonts = {}
     for weight, size in set(styles):
         filename = "LiberationSans-Bold.ttf" if weight == 700 else "LiberationSans-Regular.ttf"
@@ -126,7 +128,8 @@ def draw_text(canvas, obj, x, y, height):
             cursor += fonts[key].getlength(text)
 
 
-def render_lbx(data):
+def render_lbx(data, *, allow_empty=False):
+    """Render supported LBX; empty output is permitted only for editor callers."""
     if len(data) > 10_000_000:
         raise core.DiagnosticError("LBX exceeds the diagnostic size limit")
     try:
@@ -155,7 +158,7 @@ def render_lbx(data):
                 raise core.DiagnosticError("Recorded LBX printable band does not fit the diagnostic limits")
             canvas = Image.new("L", (round(bw * SCALE), round(bh * SCALE)), 255)
             objects = list(needed(sheet, "pt:objects"))
-            if not objects:
+            if not objects and not allow_empty:
                 raise core.DiagnosticError("LBX contains no printable objects")
             for obj in objects:
                 if obj.tag not in (f"{{{NS['text']}}}text", f"{{{NS['image']}}}image"):
@@ -168,7 +171,7 @@ def render_lbx(data):
                 if min(x, y) < -0.01 or height <= 0 or width <= 0 or y + height > canvas.height + 1:
                     raise core.DiagnosticError("Object extends outside the printable band")
                 if obj.tag == f"{{{NS['text']}}}text":
-                    draw_text(canvas, obj, x, y, height)
+                    draw_text(canvas, obj, x, y, height, allow_empty=allow_empty)
                 else:
                     image_style = needed(obj, "image:imageStyle")
                     name = image_style.get("fileName", "")
@@ -190,7 +193,7 @@ def render_lbx(data):
             raster = canvas.resize((pixels, core.PRINT_DOTS), Image.Resampling.LANCZOS).point(
                 lambda value: 255 if value >= 128 else 0, mode="1"
             )
-            if not ImageOps.invert(raster.convert("L")).getbbox():
+            if not allow_empty and not ImageOps.invert(raster.convert("L")).getbbox():
                 raise core.DiagnosticError("LBX rendered an empty label")
             return raster, {"tape_mm": 12, "content_length_mm": bw * 25.4 / 72,
                             "objects": len(objects), "font_substitution": "Arial -> Liberation Sans",
