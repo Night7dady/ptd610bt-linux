@@ -120,6 +120,8 @@ class PrinterController(QObject):
             mac, channel = self._device(mac, channel)
             if image.mode != "1" or image.height != core.PRINT_DOTS or not 1 <= image.width <= core.MAX_COLUMNS:
                 raise ValueError("预览必须是宽度不超过 80 mm、高度 64 点的黑白标签。")
+            if image.histogram()[0] == 0:
+                raise ValueError("标签为空，请添加或恢复可见内容后再打印。")
             snapshot = image.copy()
         except (ValueError, AttributeError) as exc:
             return self._reject(exc)

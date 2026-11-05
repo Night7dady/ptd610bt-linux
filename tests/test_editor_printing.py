@@ -59,6 +59,7 @@ class WorkerTests(unittest.TestCase):
         finished = []
         controller.finished.connect(lambda ok, msg: finished.append((ok, msg)))
         image = Image.new("1", (100, 64), 255)
+        image.putpixel((50, 32), 0)
         self.assertTrue(controller.print_label(image, MAC))
         self.assertTrue(controller.busy)
         self.assertFalse(controller.print_label(image, MAC))
@@ -76,7 +77,9 @@ class WorkerTests(unittest.TestCase):
         controller = PrinterController(service=service)
         results = []
         controller.finished.connect(lambda ok, msg: results.append((ok, msg)))
-        self.assertTrue(controller.print_label(Image.new("1", (100, 64), 255), MAC))
+        image = Image.new("1", (100, 64), 255)
+        image.putpixel((50, 32), 0)
+        self.assertTrue(controller.print_label(image, MAC))
         drain(controller)
         self.assertFalse(results[-1][0])
         self.assertIn("不确定", results[-1][1])
@@ -92,6 +95,16 @@ class WorkerTests(unittest.TestCase):
         drain(controller)
         self.assertFalse(results[-1][0])
         self.assertIn("connection refused", results[-1][1])
+
+    def test_blank_preview_never_contacts_printer(self):
+        service = MagicMock()
+        controller = PrinterController(service=service)
+        results = []
+        controller.finished.connect(lambda ok, msg: results.append((ok, msg)))
+        self.assertFalse(controller.print_label(Image.new("1", (100, 64), 255), MAC))
+        self.assertFalse(controller.busy)
+        self.assertIn("标签为空", results[-1][1])
+        service.print_label.assert_not_called()
 
     def test_service_closes_socket_and_preserves_verified_raster(self):
         sock, session = MagicMock(), MagicMock()

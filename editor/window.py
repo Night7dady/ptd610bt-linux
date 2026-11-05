@@ -6,13 +6,13 @@ from pathlib import Path
 import re
 
 from PIL import Image
-from PySide6.QtCore import Qt, QSignalBlocker, QTimer
-from PySide6.QtGui import QAction, QFont, QImage, QKeySequence, QPixmap
+from PySide6.QtCore import Qt, QEvent, QSignalBlocker, QTimer
+from PySide6.QtGui import QAction, QColor, QFont, QImage, QKeySequence, QPalette, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QAbstractItemView, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog,
+    QDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSlider, QSpinBox, QSplitter, QTextEdit, QToolBar,
+    QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QStyle, QTextEdit, QToolBar,
     QVBoxLayout, QWidget,
 )
 
@@ -36,9 +36,27 @@ class MainWindow(QMainWindow):
         self._length_pending = False
         self._raster = None
         self._shown_once = False
+        self._auto_fit = True
+        self._fit_queued = False
+        app = QApplication.instance()
+        if not getattr(app, "_ptd610bt_editor_fusion", False):
+            # Let QApplication own the style through its supported API. Sharing
+            # a manually installed QStyle among stylesheet widgets is unsafe.
+            app.setStyle("Fusion")
+            app._ptd610bt_editor_fusion = True
+        self._fusion_style = app.style()
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.timeout.connect(self._fit_after_resize)
         self.resize(1230, 800)
-        self.setMinimumSize(1024, 680)
+        self.setMinimumSize(800, 560)
         self._build_ui()
+        self.apply_local_theme(self)
+        for widget in self.findChildren(QWidget):
+            if isinstance(widget, (QLineEdit, QTextEdit)):
+                widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                widget.customContextMenuRequested.connect(
+                    lambda point, owner=widget: self.show_context_menu(owner, point))
         printer.busyChanged.connect(self._busy_changed)
         printer.message.connect(self.set_status)
         printer.finished.connect(self._print_finished)
@@ -48,6 +66,118 @@ class MainWindow(QMainWindow):
     @property
     def busy(self):
         return bool(self.printer.busy)
+
+    @staticmethod
+    def light_palette():
+        palette = QPalette()
+        colors = {
+            "Window": "#f3f5f7", "WindowText": "#192b3b", "Base": "#ffffff",
+            "AlternateBase": "#edf1f6", "Text": "#192b3b", "Button": "#edf1f6",
+            "ButtonText": "#192b3b", "BrightText": "#ffffff", "Highlight": "#2367a8",
+            "HighlightedText": "#ffffff", "ToolTipBase": "#fffbe8", "ToolTipText": "#192b3b",
+            "PlaceholderText": "#526274", "Link": "#1f629f", "LinkVisited": "#654c8e",
+            "Light": "#ffffff", "Midlight": "#edf1f6", "Mid": "#b6c4d3",
+            "Dark": "#718096", "Shadow": "#192b3b",
+        }
+        for group in [QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive, QPalette.ColorGroup.Disabled]:
+            for role, color in colors.items():
+                palette.setColor(group, getattr(QPalette.ColorRole, role), QColor(color))
+        for role in [QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText]:
+            palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#526274"))
+        return palette
+
+    def apply_local_theme(self, widget):
+        palette = self.light_palette()
+        for child in [widget, *widget.findChildren(QWidget)]:
+            child.setPalette(palette)
+        widget.setAutoFillBackground(True)
+
+    @staticmethod
+    def _scroll_panel(widget):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setMinimumSize(0, 0)
+        scroll.setWidget(widget)
+        return scroll
+
+    def make_context_menu(self, widget):
+        menu = widget.createStandardContextMenu()
+        self.apply_local_theme(menu)
+        return menu
+
+    def show_context_menu(self, widget, point):
+        menu = self.make_context_menu(widget)
+        try:
+            menu.exec(widget.mapToGlobal(point))
+        finally:
+            menu.deleteLater()
+
+    def make_message_box(self, title, text, icon=QMessageBox.Icon.Information,
+                         buttons=QMessageBox.StandardButton.Ok):
+        dialog = QMessageBox(icon, title, str(text), buttons, self)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        self.apply_local_theme(dialog)
+        return dialog
+
+    def ask_save_changes(self):
+        dialog = self.make_message_box("标签有未保存的修改", "是否将修改另存为新的 LBX？",
+                                      QMessageBox.Icon.Question,
+                                      QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard |
+                                      QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        try:
+            return QMessageBox.StandardButton(dialog.exec())
+        finally:
+            dialog.deleteLater()
+
+    def choose_file(self, title, file_filter, proposed="", save=False):
+        dialog = QFileDialog(self, title, proposed, file_filter)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave if save else QFileDialog.AcceptMode.AcceptOpen)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile if save else QFileDialog.FileMode.ExistingFile)
+        if save:
+            dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
+        self.apply_local_theme(dialog)
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                files = dialog.selectedFiles()
+                return files[0] if files else ""
+            return ""
+        finally:
+            dialog.deleteLater()
+
+    def make_crop_dialog(self, image):
+        from .crop_dialog import ImageCropDialog
+        dialog = ImageCropDialog(image, self)
+        self.apply_local_theme(dialog)
+        return dialog
+
+    def crop_selected_image(self):
+        if self.busy:
+            return False
+        item = self._current_object()
+        if item is None or item.kind != "image":
+            self.set_status("请先选择一个内嵌图片对象。")
+            return False
+        if self._has_pending():
+            self.set_status("请先应用或撤销待处理的属性修改，再裁剪图片。")
+            return False
+        try:
+            dialog = self.make_crop_dialog(self.document.get_image(item.id))
+            try:
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return False
+                box = dialog.selected_box()
+            finally:
+                dialog.deleteLater()
+            self.document.crop_image(item.id, box)
+            self.refresh_document(item.id)
+            self.set_status("图片内容已裁剪；可撤销此操作，原图片文件未修改。")
+            return True
+        except Exception as exc:
+            self.show_error("无法裁剪图片", exc)
+            return False
 
     def _action(self, text, shortcut, callback):
         action = QAction(text, self)
@@ -60,6 +190,9 @@ class MainWindow(QMainWindow):
         self.setStyleSheet("""
             QWidget { color: #192b3b; }
             QMainWindow { background: #f3f5f7; }
+            QDialog, QMessageBox, QMenu { background: #f3f5f7; color: #192b3b; }
+            QToolTip { background: #fffbe8; color: #192b3b; border: 1px solid #718096; }
+            QMenu::item:selected { background: #2367a8; color: white; }
             QToolBar { background: #e9eef5; border: 0; spacing: 6px; padding: 6px; }
             QToolButton { background: #edf1f6; color: #192b3b; min-height: 28px; padding: 3px 10px; }
             QToolButton:hover { background: #dce7f3; }
@@ -94,8 +227,8 @@ class MainWindow(QMainWindow):
         bar.addAction(self.redo_action)
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(20, 14, 20, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
         heading = QLabel("LBX 标签工作室")
         font = QFont(); font.setPointSize(20); font.setBold(True)
         heading.setFont(font)
@@ -107,10 +240,19 @@ class MainWindow(QMainWindow):
         self.objects_panel = self._build_objects()
         self.preview_panel = self._build_preview()
         self.properties_panel = self._build_properties()
-        for panel in [self.objects_panel, self.preview_panel, self.properties_panel]:
+        self.objects_scroll = self._scroll_panel(self.objects_panel)
+        self.properties_scroll = self._scroll_panel(self.properties_panel)
+        scrollbar_width = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        for scroll, content in [(self.objects_scroll, self.objects_panel),
+                                (self.properties_scroll, self.properties_panel)]:
+            usable_width = max(content.minimumWidth(), content.minimumSizeHint().width())
+            scroll.setMinimumWidth(usable_width + scrollbar_width)
+        for panel in [self.objects_scroll, self.preview_panel, self.properties_scroll]:
             self.splitter.addWidget(panel)
-        self.splitter.setSizes([185, 640, 300])
-        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setSizes([180, 650, 300])
+        for index, factor in enumerate([1, 4, 2]):
+            self.splitter.setStretchFactor(index, factor)
         layout.addWidget(self.splitter, 1)
         self.printer_panel = self._build_printer()
         layout.addWidget(self.printer_panel)
@@ -120,12 +262,13 @@ class MainWindow(QMainWindow):
         self.status_label.setAccessibleName("操作与打印状态")
         self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.status_label)
-        self.setCentralWidget(root)
+        self.workspace_scroll = self._scroll_panel(root)
+        self.setCentralWidget(self.workspace_scroll)
         self.statusBar().showMessage("所有编辑均在内存中进行")
 
     def _build_objects(self):
         panel = QGroupBox("标签对象")
-        panel.setMinimumWidth(160)
+        panel.setMinimumWidth(145)
         column = QVBoxLayout(panel)
         self.object_list = QListWidget()
         self.object_list.setAccessibleName("标签中的文字和图片对象")
@@ -134,11 +277,13 @@ class MainWindow(QMainWindow):
         column.addWidget(self.object_list, 1)
         self.add_text_button = QPushButton("＋ 添加文字")
         self.add_image_button = QPushButton("＋ 添加图片…")
+        self.crop_button = QPushButton("裁剪所选图片…")
+        self.crop_button.clicked.connect(self.crop_selected_image)
         self.remove_button = QPushButton("移除所选对象")
         self.add_text_button.clicked.connect(self.add_text)
         self.add_image_button.clicked.connect(self.add_image_dialog)
         self.remove_button.clicked.connect(self.remove_selected)
-        for button in [self.add_text_button, self.add_image_button, self.remove_button]:
+        for button in [self.add_text_button, self.add_image_button, self.crop_button, self.remove_button]:
             column.addWidget(button)
         return panel
 
@@ -165,11 +310,14 @@ class MainWindow(QMainWindow):
         column.addWidget(self.preview_info)
         self.preview_scroll = QScrollArea()
         self.preview_scroll.setWidgetResizable(True)
+        self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_scroll.viewport().installEventFilter(self)
         self.preview_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.preview_scroll.setStyleSheet("QScrollArea { background: #e4eaf0; border-radius: 6px; }")
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMargin(24)
+        self.preview_label.setMargin(16)
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.preview_label.setAccessibleName("当前标签的黑白打印光栅预览")
         self.preview_label.setStyleSheet("background: #e4eaf0;")
         self.preview_scroll.setWidget(self.preview_label)
@@ -177,18 +325,18 @@ class MainWindow(QMainWindow):
         zoom_row = QHBoxLayout()
         zoom_label = QLabel("缩放")
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        self.zoom_slider.setRange(100, 1000)
+        self.zoom_slider.setRange(10, 1200)
         self.zoom_slider.setValue(300)
         self.zoom_slider.setSingleStep(25)
         self.zoom_slider.setAccessibleName("预览缩放百分比")
         zoom_label.setBuddy(self.zoom_slider)
         self.zoom_value = QLabel("300%")
         self.zoom_value.setMinimumWidth(48)
-        self.zoom_slider.valueChanged.connect(self._update_preview_pixmap)
+        self.zoom_slider.valueChanged.connect(self._manual_zoom_changed)
         zoom_row.addWidget(zoom_label)
         zoom_row.addWidget(self.zoom_slider, 1)
         zoom_row.addWidget(self.zoom_value)
-        self.fit_button = QPushButton("适合宽度")
+        self.fit_button = QPushButton("适合窗口")
         self.fit_button.clicked.connect(self.fit_preview)
         zoom_row.addWidget(self.fit_button)
         column.addLayout(zoom_row)
@@ -209,7 +357,7 @@ class MainWindow(QMainWindow):
 
     def _build_properties(self):
         panel = QGroupBox("对象属性")
-        panel.setMinimumWidth(270)
+        panel.setMinimumWidth(235)
         column = QVBoxLayout(panel)
         self.object_heading = QLabel("选择一个对象")
         column.addWidget(self.object_heading)
@@ -266,7 +414,11 @@ class MainWindow(QMainWindow):
 
     def _build_printer(self):
         panel = QGroupBox("蓝牙打印 · 单张")
-        row = QHBoxLayout(panel)
+        column = QVBoxLayout(panel)
+        address_row = QHBoxLayout()
+        row = QHBoxLayout()
+        column.addLayout(address_row)
+        column.addLayout(row)
         label = QLabel("打印机地址")
         self.mac_edit = QLineEdit()
         self.mac_input = self.mac_edit
@@ -295,10 +447,13 @@ class MainWindow(QMainWindow):
         self.progress.setMaximumWidth(100)
         self.progress.setAccessibleName("蓝牙任务进行中")
         self.progress.hide()
-        for widget in [label, self.mac_edit, channel_label, self.channel_spin, self.query_button,
-                       self.print_button, self.progress]:
+        address_row.addWidget(label)
+        address_row.addWidget(self.mac_edit, 1)
+        row.addWidget(channel_label)
+        row.addWidget(self.channel_spin)
+        row.addStretch(1)
+        for widget in [self.query_button, self.print_button, self.progress]:
             row.addWidget(widget)
-        row.setStretch(1, 1)
         return panel
 
     def _length_edited(self, *_):
@@ -355,7 +510,8 @@ class MainWindow(QMainWindow):
             self._load_properties()
             self._raster = self.document.render().copy()
             self.preview_info.setText(f"标签带 12 mm  ·  内容 {self.document.length_mm:.2f} mm  ·  "
-                                      f"64 点高 / 180 dpi  ·  预计成品约 {self.document.length_mm + 4:.1f} mm")
+                                      f"64 点高 / 180 dpi  ·  预计成品约 {self.document.length_mm + 4:.1f} mm"
+                                      + ("  ·  空白草稿（暂不可打印）" if self.document.is_blank else ""))
             self._update_preview_pixmap()
             self._update_title()
             self._refresh_enabled()
@@ -380,6 +536,11 @@ class MainWindow(QMainWindow):
                              (self.width_spin, item.width_mm if item else 1),
                              (self.height_spin, item.height_mm if item else 1)]:
             field.setValue(value)
+        for field in [self.x_spin, self.y_spin, self.height_spin, self.geometry_button, self.remove_button]:
+            field.setEnabled(item is not None)
+        self.crop_button.setEnabled(item is not None and item.kind == "image")
+        if item is None:
+            self.style_note.setText("标签为空白，可添加新的文字或图片。")
         self.width_spin.setEnabled(item is not None and not text)
         self.width_spin.setToolTip("自由文字不按记录宽度换行或缩放。" if text else "内嵌图片的打印宽度")
 
@@ -405,33 +566,62 @@ class MainWindow(QMainWindow):
             self._loading = False
         self._refresh_enabled()
 
+    def _manual_zoom_changed(self, *_):
+        self._auto_fit = False
+        self._update_preview_pixmap()
+
     def _update_preview_pixmap(self, *_):
         if self._raster is None:
             return
-        zoom = self.zoom_slider.value() / 100
-        self.zoom_value.setText(f"{self.zoom_slider.value()}%")
         raster = self._raster.convert("RGB")
         tape = Image.new("RGB", (raster.width + 28, 85), "white")
         tape.paste(raster, (14, (85 - raster.height) // 2))
         data = tape.tobytes()
         image = QImage(data, tape.width, tape.height, tape.width * 3, QImage.Format.Format_RGB888).copy()
-        pixmap = QPixmap.fromImage(image).scaled(round(tape.width * zoom), round(tape.height * zoom),
-                                                Qt.AspectRatioMode.KeepAspectRatio,
-                                                Qt.TransformationMode.FastTransformation)
+        if self._auto_fit:
+            viewport = self.preview_scroll.viewport().size()
+            width, height = max(1, viewport.width() - 32), max(1, viewport.height() - 32)
+            pixmap = QPixmap.fromImage(image).scaled(width, height, Qt.AspectRatioMode.KeepAspectRatio,
+                                                    Qt.TransformationMode.FastTransformation)
+            value = max(10, min(1200, round(pixmap.width() / tape.width * 100)))
+            with QSignalBlocker(self.zoom_slider):
+                self.zoom_slider.setValue(value)
+            self.preview_scroll.setWidgetResizable(True)
+        else:
+            zoom = self.zoom_slider.value() / 100
+            pixmap = QPixmap.fromImage(image).scaled(max(1, round(tape.width * zoom)),
+                                                    max(1, round(tape.height * zoom)),
+                                                    Qt.AspectRatioMode.KeepAspectRatio,
+                                                    Qt.TransformationMode.FastTransformation)
+            self.preview_scroll.setWidgetResizable(False)
+            self.preview_label.resize(pixmap.width() + 32, pixmap.height() + 32)
+        self.zoom_value.setText(f"{self.zoom_slider.value()}%")
         self.preview_label.setPixmap(pixmap)
-        self.preview_label.setMinimumSize(pixmap.width() + 48, pixmap.height() + 48)
+        # The pixmap must never impose its old size as the layout minimum.
+        self.preview_label.setMinimumSize(0, 0)
 
     def fit_preview(self):
-        if self._raster is not None:
-            available = max(1, self.preview_scroll.viewport().width() - 48)
-            value = round(available / (self._raster.width + 28) * 100)
-            self.zoom_slider.setValue(max(100, min(1000, value)))
+        self._auto_fit = True
+        self._update_preview_pixmap()
+
+    def eventFilter(self, watched, event):
+        if (watched is self.preview_scroll.viewport() and event.type() == QEvent.Type.Resize
+                and self._auto_fit and not self._fit_queued):
+            self._fit_queued = True
+            self._fit_timer.start(0)
+        return super().eventFilter(watched, event)
+
+    def _fit_after_resize(self):
+        self._fit_queued = False
+        if self._auto_fit:
+            self._update_preview_pixmap()
 
     def showEvent(self, event):
         super().showEvent(event)
         if not self._shown_once:
             self._shown_once = True
-            QTimer.singleShot(0, self.fit_preview)
+            self._fit_queued = True
+            self._fit_timer.start(0)
 
     @staticmethod
     def _interpret_numeric(spin, label):
@@ -505,7 +695,7 @@ class MainWindow(QMainWindow):
     def add_image_dialog(self):
         if self.busy or not self._commit_pending():
             return
-        name, _ = QFileDialog.getOpenFileName(self, "选择内嵌图片", "", "图片 (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
+        name = self.choose_file("选择内嵌图片", "图片 (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
         if name:
             try:
                 identity = self.document.add_image(Path(name))
@@ -539,9 +729,7 @@ class MainWindow(QMainWindow):
     def confirm_discard(self):
         if not (self.document.dirty or self._has_pending()):
             return True
-        answer = QMessageBox.question(self, "标签有未保存的修改", "是否将修改另存为新的 LBX？",
-                                      QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard |
-                                      QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
+        answer = self.ask_save_changes()
         if answer == QMessageBox.StandardButton.Save:
             return self.save_as_dialog()
         return answer == QMessageBox.StandardButton.Discard
@@ -562,7 +750,7 @@ class MainWindow(QMainWindow):
     def open_dialog(self):
         if self.busy:
             return False
-        name, _ = QFileDialog.getOpenFileName(self, "打开 LBX 标签", "", "Brother 标签 (*.lbx *.LBX)")
+        name = self.choose_file("打开 LBX 标签", "Brother 标签 (*.lbx *.LBX)")
         return self.open_path(Path(name)) if name else False
 
     def open_path(self, path):
@@ -585,8 +773,7 @@ class MainWindow(QMainWindow):
             return False
         source = self.document.source_path
         proposed = str(Path(source).with_name(Path(source).stem + "-edited.lbx")) if source else "label.lbx"
-        name, _ = QFileDialog.getSaveFileName(self, "另存为新的 LBX", proposed, "Brother 标签 (*.lbx)",
-                                             options=QFileDialog.Option.DontConfirmOverwrite)
+        name = self.choose_file("另存为新的 LBX", "Brother 标签 (*.lbx)", proposed, save=True)
         return self.save_as_path(Path(name)) if name else False
 
     def save_as_path(self, path):
@@ -625,6 +812,9 @@ class MainWindow(QMainWindow):
         if not self._commit_pending():
             return False
         try:
+            if self.document.is_blank:
+                self.set_status("标签为空白，请先添加可打印的文字或图片。")
+                return False
             image = self.document.render().copy()
             channel = self._interpret_numeric(self.channel_spin, "蓝牙通道")
             return self.printer.print_label(image, self.mac_edit.text().strip(), channel)
@@ -644,8 +834,8 @@ class MainWindow(QMainWindow):
         self.undo_action.setEnabled(not busy and bool(self.document.can_undo or self._has_pending()))
         self.redo_action.setEnabled(not busy and bool(self.document.can_redo) and not self._has_pending())
         self.query_button.setEnabled(not busy and self._valid_mac())
-        self.print_button.setEnabled(not busy and self._valid_mac())
-        self.print_action.setEnabled(not busy and self._valid_mac())
+        self.print_button.setEnabled(not busy and self._valid_mac() and not self.document.is_blank)
+        self.print_action.setEnabled(not busy and self._valid_mac() and not self.document.is_blank)
         self.progress.setVisible(busy)
 
     def _busy_changed(self, busy):
@@ -663,9 +853,11 @@ class MainWindow(QMainWindow):
 
     def show_error(self, title, error):
         self.set_status(f"{title}：{error}")
-        dialog = QMessageBox(QMessageBox.Icon.Critical, title, str(error), parent=self)
-        dialog.setTextFormat(Qt.TextFormat.PlainText)
-        dialog.exec()
+        dialog = self.make_message_box(title, str(error), QMessageBox.Icon.Critical)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def closeEvent(self, event):
         if self.busy:

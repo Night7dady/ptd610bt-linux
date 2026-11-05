@@ -177,7 +177,7 @@ class LabelDocument:
     def _validated_render(data):
         _read_archive(data)
         try:
-            return legacy.render_lbx(data)
+            return legacy.render_lbx(data, allow_empty=True)
         except (ValueError, OSError, OverflowError, Image.DecompressionBombError) as exc:
             raise core.DiagnosticError(f'Cannot render LBX: {exc}') from exc
 
@@ -220,6 +220,11 @@ class LabelDocument:
     @property
     def dirty(self) -> bool:
         return _fingerprint(self._data) != self._saved_fingerprint
+
+    @property
+    def is_blank(self) -> bool:
+        """Whether the rendered raster has no printable black pixels."""
+        return self._image.histogram()[0] == 0
 
     @property
     def can_undo(self) -> bool:
@@ -310,6 +315,11 @@ class LabelDocument:
         """Apply all fields as one validated mutation and one undo step."""
         parts, comment, root = _read_archive(self._data)
         obj = self._find(root, object_id)
+        if text == '' and obj.tag == _tag('text', 'text'):
+            _objects_node(root).remove(obj)
+            self._commit(parts, comment, root,
+                         ids=tuple(key for key in self._ids if key != object_id))
+            return
         if any(value is not None for value in (text, font_size, bold)):
             if obj.tag != _tag('text', 'text'):
                 raise core.DiagnosticError('Select a text object to edit text')
@@ -397,9 +407,60 @@ class LabelDocument:
         self._next_id += 1
         return key
 
+    def get_image(self, object_id: str) -> Image.Image:
+        """Return an independent RGBA copy of the original embedded bitmap."""
+        parts, _, root = _read_archive(self._data)
+        obj = self._find(root, object_id)
+        if obj.tag != _tag('image', 'image'):
+            raise core.DiagnosticError('Select an image object')
+        name = legacy.needed(obj, 'image:imageStyle').get('fileName')
+        payload = next((data for item, data in parts if item.filename == name), None)
+        if payload is None:
+            raise core.DiagnosticError('The embedded image is missing')
+        try:
+            with Image.open(io.BytesIO(payload)) as image:
+                if image.width * image.height > 5_000_000:
+                    raise core.DiagnosticError('Image exceeds the 5 megapixel limit')
+                return image.convert('RGBA').copy()
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            raise core.DiagnosticError(f'Cannot read embedded image: {exc}') from exc
+
+    def crop_image(self, object_id: str, box: tuple[int, int, int, int]):
+        """Crop source pixels, retaining print scale and the object's x/y position.
+
+        A fresh PNG entry is created so other objects sharing the original asset
+        remain unchanged. The whole bitmap/geometry replacement is one undo step.
+        """
+        if (not isinstance(box, (tuple, list)) or len(box) != 4
+                or any(not isinstance(value, int) or isinstance(value, bool) for value in box)):
+            raise core.DiagnosticError('Crop bounds must be four integer pixel coordinates')
+        image = self.get_image(object_id)
+        left, top, right, bottom = box
+        if not (0 <= left < right <= image.width and 0 <= top < bottom <= image.height):
+            raise core.DiagnosticError('Crop bounds must form a nonempty rectangle inside the image')
+        if tuple(box) == (0, 0, image.width, image.height):
+            return
+        cropped = image.crop(box)
+        output = io.BytesIO()
+        cropped.save(output, format='PNG')
+        parts, comment, root = _read_archive(self._data)
+        obj = self._find(root, object_id)
+        style = legacy.needed(obj, 'image:imageStyle')
+        filename = f'editor-image-{uuid.uuid4().hex}.png'
+        entry = zipfile.ZipInfo(filename)
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        parts.append((entry, output.getvalue()))
+        style.set('fileName', filename)
+        trimming = style.find('image:trimming', NS)
+        if trimming is None:
+            trimming = ET.SubElement(style, _tag('image', 'trimming'))
+        trimming.set('flag', 'false')
+        geometry = legacy.needed(obj, 'pt:objectStyle')
+        geometry.set('width', _dimension(legacy.pt(geometry.get('width')) * cropped.width / image.width))
+        geometry.set('height', _dimension(legacy.pt(geometry.get('height')) * cropped.height / image.height))
+        self._commit(parts, comment, root)
+
     def remove(self, object_id: str):
-        if len(self._ids) <= 1:
-            raise core.DiagnosticError('Keep at least one printable object')
         parts, comment, root = _read_archive(self._data)
         _objects_node(root).remove(self._find(root, object_id))
         self._commit(parts, comment, root, ids=tuple(key for key in self._ids if key != object_id))
