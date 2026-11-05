@@ -7,6 +7,17 @@
 **12 mm 覆膜 TZe 标签带**。打印脚本已在 Fedora 44 / KDE 上完成实体标签验证；
 打包阶段运行离线测试，不额外打印。
 
+## 图形编辑器（开发分支）
+
+打开、预览和编辑简单 LBX，另存为新文件，并通过蓝牙打印当前预览。
+
+```bash
+sudo dnf install python3-pyside6
+./launch-gui.sh
+```
+
+详见 [图形编辑器使用说明](docs/GUI.md)。命令行及现有双击直接打印入口保持兼容。
+
 ## 快速开始
 
 Fedora 的命令行依赖：
@@ -46,7 +57,7 @@ LBX 的多页、条码、旋转对象等不支持布局会报错，不会悄悄�
 python3 -I -B -m unittest discover -s tests -v
 ```
 
-目前 36 项离线测试覆盖协议、光栅方向、完成回包、LBX 和桌面配置生成。
+离线测试覆盖协议、光栅方向、完成回包、LBX、桌面配置生成，以及 GUI 编辑和后台任务。
 本项目提供供 Codex 使用的 [AGENTS.md](AGENTS.md)；在当前 Codex 会话中读取该文件即可了解
 命令和边界。无需外部模型工具或共享 Agent 配置。参与开发见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 

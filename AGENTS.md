@@ -7,7 +7,7 @@ Bluetooth Classic SPP uses RFCOMM channel 2 by default.
 
 Print one bounded label on Brother PT-D610BT over an already paired Linux Bluetooth
 connection. Current support is 12 mm laminated TZe, 64-dot printable height, 180 dpi.
-LBX support is intentionally limited; this is not an editor or official Brother SDK.
+LBX support is intentionally limited. The optional native editor saves new files only; this is not an official Brother SDK.
 
 ## Commands
 
@@ -23,6 +23,16 @@ python3 -I -B tools/configure_desktop.py --help
 `setup.sh` checks existing dependencies only. No package installation, downloads,
 pairing, service changes, configuration installation or printing is automatic.
 Tests are offline and use mocked sockets and synthetic in-memory labels.
+
+## GUI development
+
+Run `./launch-gui.sh [label.lbx]` with optional PySide6. Test with `QT_QPA_PLATFORM=offscreen python3 -I -B -m unittest discover -s tests -v`.
+
+- `editor/document.py`: transactional LBX edits, exact raster preview and exclusive Save As.
+- `editor/window.py`: native Qt controls and unsaved-change guards.
+- `editor/printing.py`: one asynchronous Bluetooth operation at a time.
+- User input files remain read-only; edits may be saved only to a new filename.
+- Never print during automated tests, and never change installed MIME defaults while developing GUI.
 
 ## Architecture
 
